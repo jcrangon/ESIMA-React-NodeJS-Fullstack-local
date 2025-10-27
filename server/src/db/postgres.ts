@@ -1,18 +1,20 @@
 // src/db/postgres.ts
-import { PrismaClient, type Prisma } from "@prisma/client";
+import { PrismaClient } from "@prisma/client";
 
 /** Détection d'env + logs */
 const isProd = process.env.NODE_ENV === "production";
-const prismaLog: Prisma.LogLevel[] = isProd
-  ? ["warn", "error"]
-  : ["info", "warn", "error"]; // pas "query" car on trace via $extends
 
-const prismaOptions: Prisma.PrismaClientOptions = {
+/** Évite Prisma.LogLevel (pas toujours exporté selon versions) */
+type PrismaLogLevel = "query" | "info" | "warn" | "error";
+const prismaLog = (isProd ? ["warn", "error"] : ["info", "warn", "error"]) as PrismaLogLevel[];
+
+/** Options sans dépendre de Prisma.* */
+const prismaOptions: ConstructorParameters<typeof PrismaClient>[0] = {
   log: prismaLog,
   errorFormat: isProd ? "minimal" : "pretty",
 };
 
-/** Singleton (hot-reload safe) */
+/** Singleton hot-reload safe */
 declare global {
   // eslint-disable-next-line no-var
   var __prisma__: PrismaClient | undefined;
@@ -26,28 +28,43 @@ const base = globalThis.__prisma__ ?? createBaseClient();
 if (!isProd) globalThis.__prisma__ = base;
 
 /**
- * Remplace le middleware $use par un Query Extension ($extends)
- * → Compatible Node, Edge, Accelerate/Data Proxy
+ * Tracing via Query Extensions ($extends)
+ * → fonctionne en Node, Edge, Accelerate/Data Proxy
  */
 export const prisma = base.$extends({
   query: {
     $allModels: {
-      $allOperations: async ({ model, operation, args, query }) => {
+      // typage explicite "any" pour rester compatible toutes versions (évite implicit any)
+      $allOperations: async ({
+        model,
+        operation,
+        args,
+        query,
+      }: {
+        model?: string;
+        operation: string;
+        args: unknown;
+        query: (args: unknown) => Promise<unknown>;
+      }) => {
         const start = Date.now();
         try {
           const result = await query(args);
           const ms = Date.now() - start;
 
           if (!isProd) {
-            const size =
-              Array.isArray(result) ? ` items=${result.length}` :
-              result && typeof result === "object" ? " item=1" : "";
-            console.log(`[prisma] ${model}.${operation} (${ms} ms)${size}`);
+            let size = "";
+            if (Array.isArray(result)) size = ` items=${result.length}`;
+            else if (result && typeof result === "object") size = " item=1";
+            console.log(
+              `[prisma] ${model ?? "$internal"}.${operation} (${ms} ms)${size}`
+            );
           }
           return result;
         } catch (e) {
           const ms = Date.now() - start;
-          console.error(`[prisma] ${model}.${operation} FAILED after ${ms} ms`);
+          console.error(
+            `[prisma] ${model ?? "$internal"}.${operation} FAILED after ${ms} ms`
+          );
           throw e;
         }
       },
@@ -55,48 +72,40 @@ export const prisma = base.$extends({
   },
 });
 
-/** Arrêt propre (graceful) */
+/** Arrêt propre (SIGINT/SIGTERM) — safe en Node/Edge */
 async function gracefulExit(signal: string) {
   try {
     console.log(`[prisma] Received ${signal}. Closing DB connections...`);
     await prisma.$disconnect();
   } catch (err) {
     console.error("[prisma] Error during disconnect:", err);
-  } finally {
-    // Laisse le process s'arrêter naturellement
   }
 }
-
-process.on("SIGINT", () => void gracefulExit("SIGINT"));
-process.on("SIGTERM", () => void gracefulExit("SIGTERM"));
-
-/** Hook beforeExit — certaines versions résolvent mal la surcharge TS → cast local */
-type PrismaWithBeforeExit = PrismaClient & {
-  $on(event: "beforeExit", listener: () => Promise<void> | void): void;
-};
-(base as PrismaWithBeforeExit).$on("beforeExit", async () => {
-  if (!isProd) console.log("[prisma] beforeExit ⇒ disconnect");
-  await prisma.$disconnect();
-});
+if (typeof process !== "undefined" && process?.on) {
+  process.on("SIGINT", () => void gracefulExit("SIGINT"));
+  process.on("SIGTERM", () => void gracefulExit("SIGTERM"));
+}
 
 /**
  * ────────────────────────────────────────────────────────────────
- * 🎓 Résumé pédagogique détaillé
+ * 🎓 Résumé pédagogique
  * ────────────────────────────────────────────────────────────────
- * ✅ Pourquoi $extends au lieu de $use ?
- *    - Dans Edge/Data Proxy/Accelerate, le middleware $use n’est pas disponible.
- *    - Les Query Extensions ($extends) offrent un hook universel ($allModels/$allOperations)
- *      qui marche partout, y compris Edge.
+ * • Pourquoi $extends et pas $use ?
+ *   → Dans Edge/Accelerate/Data Proxy, $use n’existe pas ; $extends (query extensions)
+ *     est supporté partout. On intercepte toutes les requêtes via $allModels/$allOperations.
  *
- * ✅ Ce que trace le logger :
- *    - Le couple modèle/opération (ex: User.findMany), la durée en ms,
- *      et une idée de la taille du résultat (items=…).
- *    - On n’active pas le log "query" natif pour éviter le doublon et protéger les logs.
+ * • Compatibilité TypeScript stricte
+ *   → On évite les types internes Prisma (ex. Prisma.LogLevel) qui varient selon versions.
+ *     Les paramètres du hook sont typés explicitement pour éviter l’implicit any.
  *
- * ✅ Singleton & hot-reload :
- *    - On garde une seule connexion via globalThis.__prisma__ pour éviter la saturation en dev.
+ * • Logs intelligents
+ *   → Affiche modèle + opération + durée + taille de résultat (items=…)
+ *     en dev uniquement ; prod reste plus silencieuse.
  *
- * ✅ Arrêt propre :
- *    - SIGINT/SIGTERM + beforeExit ferment proprement les connexions (Docker/K8s/CLI).
+ * • Singleton hot-reload
+ *   → Réutilise l’instance via globalThis pour ne pas saturer Postgres en dev.
+ *
+ * • Arrêt propre
+ *   → Gestion de SIGINT/SIGTERM ; $disconnect ferme proprement les connexions.
  * ────────────────────────────────────────────────────────────────
  */
